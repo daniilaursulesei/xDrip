@@ -21,6 +21,7 @@ public class UiBasedCollectorTest extends RobolectricTestWithConfig {
         super.setUp();
         PersistentStore.setLong("UI_BASED_STORE_LAST_VALUE", 0);
         PersistentStore.setLong("UI_BASED_STORE_LAST_REPEAT", 0);
+        PersistentStore.setLong("UI_BASED_STORE_LAST_TIME", 0);
     }
 
     @Test
@@ -252,14 +253,140 @@ public class UiBasedCollectorTest extends RobolectricTestWithConfig {
         val start = JoH.tsl();
 
         // :: Act - insert same value 10 times at 10-min intervals
-        for (int i = 0; i <= 9; i++) {
+        // For Medtronic a same value is held back first, and saved when no new value arrives.
+        assertWithMessage("reading 0 accepted")
+                .that(ui.handleNewValue(start, 100)).isTrue();
+        for (int i = 1; i <= 9; i++) {
+            assertWithMessage("reading " + i + " held")
+                    .that(ui.handleNewValue(start + Constants.MINUTE_IN_MS * 10 * i, 100)).isFalse();
             assertWithMessage("reading " + i + " accepted")
-                    .that(ui.handleNewValue(start + Constants.MINUTE_IN_MS * 10 * i, 100)).isTrue();
+                    .that(ui.saveHeldValue()).isTrue();
         }
 
         // :: Verify - 11th same value rejected by jam detection
-        assertWithMessage("11th identical value rejected by jam detection")
+        assertWithMessage("11th identical value held")
                 .that(ui.handleNewValue(start + Constants.MINUTE_IN_MS * 10 * 10, 100)).isFalse();
+        assertWithMessage("11th identical value rejected by jam detection")
+                .that(ui.saveHeldValue()).isFalse();
+    }
+
+    private static final String GUARDIAN = "com.medtronic.diabetes.guardian";
+
+    private static boolean readingAt(final long timestamp) {
+        return BgReading.getForPreciseTimestamp(timestamp, Constants.SECOND_IN_MS, false) != null;
+    }
+
+    /**
+     * Replays a real Guardian 4 log (Guardian app 1.6.0). Guardian posts the glucose notification
+     * again every 2 minutes with the same value. Only the 5 real readings may be saved.
+     * Before the fix, the re-posts at +288 s and +888 s were saved as extra readings.
+     */
+    @Test
+    public void medtronic_realGuardianLog_onlyRealReadingsSaved() {
+        // :: Setup
+        BgReading.deleteALL();
+        val ui = new UiBasedCollector();
+        ui.lastPackage = GUARDIAN;
+        val start = JoH.tsl(); // 02:26:56.278 in the log
+
+        // time in ms after start, value, expected result
+        final long[][] events = {
+                {0, 141, 1},       // 02:26:56 real reading
+                {48162, 141, 0},   // 02:27:44 re-post
+                {168193, 141, 0},  // 02:29:44 re-post
+                {288289, 141, 0},  // 02:31:44 re-post, held
+                {300058, 144, 1},  // 02:31:56 real reading, drops the held re-post
+                {323398, 144, 0},  // 02:32:19 re-post
+                {326714, 144, 0},  // 02:32:22 re-post
+                {600824, 151, 1},  // 02:36:57 real reading (after "Updating...")
+                {648399, 151, 0},  // 02:37:44 re-post
+                {768454, 151, 0},  // 02:39:44 re-post
+                {888493, 151, 0},  // 02:41:44 re-post, held
+                {900841, 155, 1},  // 02:41:57 real reading, drops the held re-post
+                {1008505, 155, 0}, // 02:43:44 re-post
+                {1128542, 155, 0}, // 02:45:44 re-post
+                {1200338, 163, 1}, // 02:46:56 real reading
+        };
+
+        // :: Act & Verify
+        for (val event : events) {
+            assertWithMessage("value " + event[1] + " at +" + event[0] + " ms")
+                    .that(ui.handleNewValue(start + event[0], (int) event[1])).isEqualTo(event[2] == 1);
+        }
+        assertWithMessage("nothing left to save").that(ui.saveHeldValue()).isFalse();
+        assertWithMessage("no reading from re-post at +288 s").that(readingAt(start + 288289)).isFalse();
+        assertWithMessage("no reading from re-post at +888 s").that(readingAt(start + 888493)).isFalse();
+        assertWithMessage("real reading at +300 s").that(readingAt(start + 300058)).isTrue();
+        assertWithMessage("real reading at +900 s").that(readingAt(start + 900841)).isTrue();
+    }
+
+    /**
+     * A real reading with the same value as the one before (flat glucose) is still saved,
+     * after the hold time, even when a re-post came a few seconds before it.
+     */
+    @Test
+    public void medtronic_flatValue_savedOncePerReading() {
+        // :: Setup
+        BgReading.deleteALL();
+        val ui = new UiBasedCollector();
+        ui.lastPackage = GUARDIAN;
+        val start = JoH.tsl();
+        val s = Constants.SECOND_IN_MS;
+
+        // :: Act & Verify
+        assertWithMessage("first reading").that(ui.handleNewValue(start, 100)).isTrue();
+        assertWithMessage("re-post +47 s").that(ui.handleNewValue(start + 47 * s, 100)).isFalse();
+        assertWithMessage("re-post +167 s").that(ui.handleNewValue(start + 167 * s, 100)).isFalse();
+        assertWithMessage("re-post +287 s held").that(ui.handleNewValue(start + 287 * s, 100)).isFalse();
+        assertWithMessage("real +300 s, already held").that(ui.handleNewValue(start + 300 * s, 100)).isFalse();
+        assertWithMessage("held value saved").that(ui.saveHeldValue()).isTrue();
+        assertWithMessage("only one reading for this 5 minutes").that(ui.saveHeldValue()).isFalse();
+
+        assertWithMessage("re-post +407 s").that(ui.handleNewValue(start + 407 * s, 100)).isFalse();
+        assertWithMessage("re-post +527 s").that(ui.handleNewValue(start + 527 * s, 100)).isFalse();
+        assertWithMessage("real +600 s held").that(ui.handleNewValue(start + 600 * s, 100)).isFalse();
+        assertWithMessage("real +600 s saved").that(ui.saveHeldValue()).isTrue();
+        assertWithMessage("reading at +600 s").that(readingAt(start + 600 * s)).isTrue();
+    }
+
+    /**
+     * If the delayed save did not run (for example in doze), the held value is saved
+     * when the next value arrives, and not lost.
+     */
+    @Test
+    public void medtronic_heldValueNotLostWhenDelayedSaveDidNotRun() {
+        // :: Setup
+        BgReading.deleteALL();
+        val ui = new UiBasedCollector();
+        ui.lastPackage = GUARDIAN;
+        val start = JoH.tsl();
+        val s = Constants.SECOND_IN_MS;
+
+        // :: Act
+        assertWithMessage("first reading").that(ui.handleNewValue(start, 100)).isTrue();
+        assertWithMessage("same value +300 s held").that(ui.handleNewValue(start + 300 * s, 100)).isFalse();
+        assertWithMessage("new value +600 s").that(ui.handleNewValue(start + 600 * s, 110)).isTrue();
+
+        // :: Verify
+        assertWithMessage("held reading at +300 s saved").that(readingAt(start + 300 * s)).isTrue();
+        assertWithMessage("reading at +600 s").that(readingAt(start + 600 * s)).isTrue();
+    }
+
+    /**
+     * Other companion apps keep the old behaviour: a same value 5 minutes later is saved at once.
+     */
+    @Test
+    public void nonMedtronic_sameValue5minApart_savedAtOnce() {
+        // :: Setup
+        BgReading.deleteALL();
+        val ui = new UiBasedCollector();
+        ui.lastPackage = "com.dexcom.g7";
+        val start = JoH.tsl();
+
+        // :: Act & Verify
+        assertWithMessage("first reading").that(ui.handleNewValue(start, 100)).isTrue();
+        assertWithMessage("same value 5 min later")
+                .that(ui.handleNewValue(start + Constants.MINUTE_IN_MS * 5, 100)).isTrue();
     }
 
 }

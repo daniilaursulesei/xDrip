@@ -58,6 +58,7 @@ public class UiBasedCollector extends NotificationListenerService {
     private static final String TAG = UiBasedCollector.class.getSimpleName();
     private static final String UI_BASED_STORE_LAST_VALUE = "UI_BASED_STORE_LAST_VALUE";
     private static final String UI_BASED_STORE_LAST_REPEAT = "UI_BASED_STORE_LAST_REPEAT";
+    private static final String UI_BASED_STORE_LAST_TIME = "UI_BASED_STORE_LAST_TIME";
     private static final String COMPANION_APP_IOB_ENABLED_PREFERENCE_KEY = "fetch_iob_from_companion_app";
     private static final String ENABLED_NOTIFICATION_LISTENERS = "enabled_notification_listeners";
     private static final String ACTION_NOTIFICATION_LISTENER_SETTINGS = "android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS";
@@ -68,8 +69,18 @@ public class UiBasedCollector extends NotificationListenerService {
     private static final HashSet<Pattern> companionAppIoBRegexes = new HashSet<>();
     private static boolean debug = false;
 
+    // Medtronic apps post the glucose notification again every 2 minutes with the same value.
+    // A same value is only a real reading if it comes at least this long after the last reading.
+    private static final long MEDTRONIC_SAME_VALUE_MIN_GAP = Constants.SECOND_IN_MS * 285;
+    // How long a same value is held back, in case it was a re-post just before a new reading.
+    private static final long MEDTRONIC_HOLD_TIME = Constants.SECOND_IN_MS * 20;
+
     @VisibleForTesting
     String lastPackage;
+
+    private int heldMgdl = 0;
+    private long heldTimestamp = 0;
+    private final Runnable saveHeldValueRunnable = this::saveHeldValue;
 
     static {
         coOptedPackages.add("com.dexcom.g6");
@@ -399,6 +410,71 @@ public class UiBasedCollector extends NotificationListenerService {
 
         UserError.Log.d(TAG, "Found specific value: " + mgdl);
 
+        if (isMedtronic() && mgdl >= 40 && mgdl <= 405) {
+            return handleMedtronicValue(timestamp, mgdl);
+        }
+        return insertValue(timestamp, mgdl);
+    }
+
+    /**
+     * Medtronic apps (for example Guardian) post the glucose notification again every 2 minutes,
+     * with the same value and a new time. A real reading comes only every 5 minutes. So a value
+     * that is the same as the last reading is only a real reading if it comes about 5 minutes
+     * after it. A re-post can still come a few seconds before a new reading. So such a value is
+     * held back for a short time, and dropped if a different value arrives in that time.
+     */
+    private synchronized boolean handleMedtronicValue(final long timestamp, final int mgdl) {
+        if (heldTimestamp != 0 && timestamp - heldTimestamp > MEDTRONIC_HOLD_TIME) {
+            // the delayed save did not run in time (for example in doze), so save it now
+            saveHeldValue();
+        }
+
+        if (isDifferentToLast(mgdl)) {
+            if (heldTimestamp != 0) {
+                UserError.Log.d(TAG, "New value " + mgdl + " arrived, dropping held re-post of " + heldMgdl);
+                clearHeldValue();
+            }
+            return insertValue(timestamp, mgdl);
+        }
+
+        val sinceLast = timestamp - PersistentStore.getLong(UI_BASED_STORE_LAST_TIME);
+        if (sinceLast < 0) {
+            // time went backwards, so we cannot judge it: use the normal checks
+            return insertValue(timestamp, mgdl);
+        }
+        if (sinceLast < MEDTRONIC_SAME_VALUE_MIN_GAP) {
+            UserError.Log.d(TAG, "Ignoring re-post of same value " + mgdl + ", " + (sinceLast / 1000) + "s after last reading");
+            return false;
+        }
+        if (heldTimestamp == 0) {
+            UserError.Log.d(TAG, "Holding same value " + mgdl + " for " + (MEDTRONIC_HOLD_TIME / 1000) + "s, in case it is a re-post");
+            heldMgdl = mgdl;
+            heldTimestamp = timestamp;
+            JoH.runOnUiThreadDelayed(saveHeldValueRunnable, MEDTRONIC_HOLD_TIME);
+        } else {
+            UserError.Log.d(TAG, "Same value " + mgdl + " is already held");
+        }
+        return false;
+    }
+
+    // Saves the held value, if there is one. Called when no different value arrived in time.
+    @VisibleForTesting
+    synchronized boolean saveHeldValue() {
+        if (heldTimestamp == 0) return false;
+        val timestamp = heldTimestamp;
+        val mgdl = heldMgdl;
+        clearHeldValue();
+        UserError.Log.d(TAG, "No new value arrived, saving held value " + mgdl);
+        return insertValue(timestamp, mgdl);
+    }
+
+    private void clearHeldValue() {
+        JoH.removeUiThreadRunnable(saveHeldValueRunnable);
+        heldTimestamp = 0;
+        heldMgdl = 0;
+    }
+
+    private boolean insertValue(final long timestamp, final int mgdl) {
         if ((mgdl >= 40 && mgdl <= 405)) {
             val grace = DexCollectionType.getCurrentSamplePeriod() * 4;
             val recentbt = msSince(lastReadingTimestamp) < grace;
@@ -412,6 +488,7 @@ public class UiBasedCollector extends NotificationListenerService {
                 } else {
                     UserError.Log.d(TAG, "Inserting new value");
                     PersistentStore.setLong(UI_BASED_STORE_LAST_VALUE, mgdl);
+                    PersistentStore.setLong(UI_BASED_STORE_LAST_TIME, timestamp);
                     val bgr = BgReading.bgReadingInsertFromG5(mgdl, timestamp);
                     if (bgr != null) {
                         bgr.find_slope();
@@ -457,10 +534,12 @@ public class UiBasedCollector extends NotificationListenerService {
     }
 
     private int jamThreshold() {
-        if (lastPackage != null) {
-            if (lastPackage.startsWith("com.medtronic")) return 9;
-        }
+        if (isMedtronic()) return 9;
         return 6;
+    }
+
+    private boolean isMedtronic() {
+        return lastPackage != null && lastPackage.startsWith("com.medtronic");
     }
 
     private void getTextViews(final List<TextView> output, final ViewGroup parent) {
